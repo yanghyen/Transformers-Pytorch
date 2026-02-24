@@ -1,24 +1,21 @@
-from model import build_transformer
-from dataset import BilingualDataset, causal_mask
-from config import get_config, get_weights_file_path
+from config.config import get_config, get_weights_file_path, get_run_id, ensure_run_dirs, seed_everything
+from src.model import build_transformer
+from src.dataset.dataset import (
+    build_tokenized_dataset,
+    causal_mask,
+    TokenBasedBatchSampler,
+    collate_fn_variable_length,
+)
+from functools import partial
 
-import torchtext.datasets as datasets
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, random_split
-from torch.optim.lr_scheduler import LambdaLR
+from torch.utils.data import DataLoader
 
 import warnings
 from tqdm import tqdm
 import os
 from pathlib import Path
-
-# Huggingface datasets and tokenizers
-from datasets import load_dataset
-from tokenizers import Tokenizer
-from tokenizers.models import WordLevel
-from tokenizers.trainers import WordLevelTrainer
-from tokenizers.pre_tokenizers import Whitespace
 
 import wandb
 
@@ -119,69 +116,55 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
     bleu = metric(predicted, expected)
     wandb.log({'validation/BLEU': bleu, 'global_step': global_step})
 
-def get_all_sentences(ds, lang):
-    for item in ds:
-        yield item['translation'][lang]
-
-def get_or_build_tokenizer(config, ds, lang):
-    tokenizer_path = Path(config['tokenizer_file'].format(lang))
-    if not Path.exists(tokenizer_path):
-        # Most code taken from: https://huggingface.co/docs/tokenizers/quicktour
-        tokenizer = Tokenizer(WordLevel(unk_token="[UNK]"))
-        tokenizer.pre_tokenizer = Whitespace()
-        trainer = WordLevelTrainer(special_tokens=["[UNK]", "[PAD]", "[SOS]", "[EOS]"], min_frequency=2)
-        tokenizer.train_from_iterator(get_all_sentences(ds, lang), trainer=trainer)
-        tokenizer.save(str(tokenizer_path))
-    else:
-        tokenizer = Tokenizer.from_file(str(tokenizer_path))
-    return tokenizer
-
 def get_ds(config):
-    # It only has the train split, so we divide it overselves
-    ds_raw = load_dataset('opus_books', f"{config['lang_src']}-{config['lang_tgt']}", split='train')
+    train_ds, val_ds, tokenizer_src, tokenizer_tgt = build_tokenized_dataset(config)
 
-    # Build tokenizers
-    tokenizer_src = get_or_build_tokenizer(config, ds_raw, config['lang_src'])
-    tokenizer_tgt = get_or_build_tokenizer(config, ds_raw, config['lang_tgt'])
+    if hasattr(train_ds, "hf_ds") and "src_len" in train_ds.hf_ds.column_names:
+        max_len_src = max(train_ds.hf_ds["src_len"])
+        max_len_tgt = max(train_ds.hf_ds["tgt_len"])
+        print(f"Max length of source sentence: {max_len_src}")
+        print(f"Max length of target sentence: {max_len_tgt}")
 
-    # Keep 90% for training, 10% for validation
-    train_ds_size = int(0.9 * len(ds_raw))
-    val_ds_size = len(ds_raw) - train_ds_size
-    train_ds_raw, val_ds_raw = random_split(ds_raw, [train_ds_size, val_ds_size])
+    use_token_batching = config.get("tokens_per_batch_src") is not None
+    tokens_tgt = config.get("tokens_per_batch_tgt") or config.get("tokens_per_batch_src")
 
-    train_ds = BilingualDataset(train_ds_raw, tokenizer_src, tokenizer_tgt, config['lang_src'], config['lang_tgt'], config['seq_len'])
-    val_ds = BilingualDataset(val_ds_raw, tokenizer_src, tokenizer_tgt, config['lang_src'], config['lang_tgt'], config['seq_len'])
-
-    # Find the maximum length of each sentence in the source and target sentence
-    max_len_src = 0
-    max_len_tgt = 0
-
-    for item in ds_raw:
-        src_ids = tokenizer_src.encode(item['translation'][config['lang_src']]).ids
-        tgt_ids = tokenizer_tgt.encode(item['translation'][config['lang_tgt']]).ids
-        max_len_src = max(max_len_src, len(src_ids))
-        max_len_tgt = max(max_len_tgt, len(tgt_ids))
-
-    print(f'Max length of source sentence: {max_len_src}')
-    print(f'Max length of target sentence: {max_len_tgt}')
-    
-
-    train_dataloader = DataLoader(train_ds, batch_size=config['batch_size'], shuffle=True)
+    if use_token_batching:
+        batch_sampler = TokenBasedBatchSampler(
+            train_ds.lengths,
+            config["tokens_per_batch_src"],
+            tokens_tgt,
+            shuffle=True,
+        )
+        collate_fn = partial(
+            collate_fn_variable_length,
+            pad_token_id=tokenizer_tgt.token_to_id("[PAD]"),
+            seq_len_max=config["seq_len"],
+            causal_mask_fn=causal_mask,
+        )
+        train_dataloader = DataLoader(train_ds, batch_sampler=batch_sampler, collate_fn=collate_fn)
+        print(f"Token-based batching: ~{config['tokens_per_batch_src']} src / ~{tokens_tgt} tgt tokens per batch")
+    else:
+        train_dataloader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True)
     val_dataloader = DataLoader(val_ds, batch_size=1, shuffle=True)
 
     return train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt
 
 def get_model(config, vocab_src_len, vocab_tgt_len):
-    model = build_transformer(vocab_src_len, vocab_tgt_len, config["seq_len"], config['seq_len'], d_model=config['d_model'])
+    model = build_transformer(
+        vocab_src_len, vocab_tgt_len, config["seq_len"], config['seq_len'],
+        d_model=config['d_model'], N=config['layers'], h=config['n_head'], d_ff=config['d_ff'],
+        dropout=config.get('dropout', 0.1),
+    )
     return model
 
 def train_model(config):
+    seed_everything(config.get("seed", 42))
     # Define the device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)
 
-    # Make sure the weights folder exists
-    Path(config['model_folder']).mkdir(parents=True, exist_ok=True)
+    # runs/run_id/tmodel, runs/run_id/metrics, runs/run_id/checkpoints 생성
+    ensure_run_dirs(config)
 
     train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt = get_ds(config)
     model = get_model(config, tokenizer_src.get_vocab_size(), tokenizer_tgt.get_vocab_size()).to(device)
@@ -247,28 +230,30 @@ def train_model(config):
         # Run validation at the end of every epoch
         run_validation(model, val_dataloader, tokenizer_src, tokenizer_tgt, config['seq_len'], device, lambda msg: batch_iterator.write(msg), global_step)
 
-        # Save the model at the end of every epoch
+        # Save the model at the end of every epoch (설정 포함)
         model_filename = get_weights_file_path(config, f"{epoch:02d}")
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            'global_step': global_step
+            'global_step': global_step,
+            'config': config,
         }, model_filename)
 
 
 if __name__ == '__main__':
+    import argparse
     warnings.filterwarnings("ignore")
-    config = get_config()
-    config['num_epochs'] = 30
-    config['preload'] = None
+    parser = argparse.ArgumentParser(description="Train transformer with Weights & Biases.")
+    parser.add_argument("--config", type=str, default="config/config.yaml", help="Path to YAML config (default: config/config.yaml)")
+    args = parser.parse_args()
+    config = get_config(yaml_path=args.config)
+    config['num_epochs'] = config.get('num_epochs', 30)
+    config['preload'] = config.get('preload', None)
 
     wandb.init(
-        # set the wandb project where this run will be logged
         project="pytorch-transformer",
-        
-        # track hyperparameters and run metadata
-        config=config
+        config=config,
     )
     
     train_model(config)

@@ -1,0 +1,15 @@
+# 모델 하이퍼파라미터 (학습 시 이 값들을 바꿔가며 실험)
+# config.py의 get_config() 기본값과 병합됩니다.
+d_model: 512
+n_head: 8
+d_ff: 2048
+layers: 6
+seed: 42
+
+# 배치: null이면 고정 batch_size(문장 수) 사용, 숫자면 토큰 기준 동적 배치
+# tokens_per_batch_src: 12000
+# tokens_per_batch_tgt: 12000
+tokens_per_batch_src: null
+tokens_per_batch_tgt: null
+# 고정 배치 사용 시 문장 수 (tokens_per_batch_* 가 null일 때만)
+batch_size: 64
