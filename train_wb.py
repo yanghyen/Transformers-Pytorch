@@ -117,7 +117,7 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
     wandb.log({'validation/BLEU': bleu, 'global_step': global_step})
 
 def get_ds(config):
-    train_ds, val_ds, tokenizer_src, tokenizer_tgt = build_tokenized_dataset(config)
+    train_ds, val_ds, test_ds, tokenizer_src, tokenizer_tgt = build_tokenized_dataset(config)
 
     if hasattr(train_ds, "hf_ds") and "src_len" in train_ds.hf_ds.column_names:
         max_len_src = max(train_ds.hf_ds["src_len"])
@@ -146,14 +146,16 @@ def get_ds(config):
     else:
         train_dataloader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True)
     val_dataloader = DataLoader(val_ds, batch_size=1, shuffle=True)
+    test_dataloader = DataLoader(test_ds, batch_size=1, shuffle=False)
 
-    return train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt
+    return train_dataloader, val_dataloader, test_dataloader, tokenizer_src, tokenizer_tgt
 
 def get_model(config, vocab_src_len, vocab_tgt_len):
     model = build_transformer(
         vocab_src_len, vocab_tgt_len, config["seq_len"], config['seq_len'],
         d_model=config['d_model'], N=config['layers'], h=config['n_head'], d_ff=config['d_ff'],
         dropout=config.get('dropout', 0.1),
+        d_k=config.get('d_k'), d_v=config.get('d_v'),
     )
     return model
 
@@ -166,7 +168,7 @@ def train_model(config):
     # runs/run_id/tmodel, runs/run_id/metrics, runs/run_id/checkpoints 생성
     ensure_run_dirs(config)
 
-    train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt = get_ds(config)
+    train_dataloader, val_dataloader, test_dataloader, tokenizer_src, tokenizer_tgt = get_ds(config)
     model = get_model(config, tokenizer_src.get_vocab_size(), tokenizer_tgt.get_vocab_size()).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config['lr'], eps=1e-9)

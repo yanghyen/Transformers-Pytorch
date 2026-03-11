@@ -1,9 +1,13 @@
 # 모델 하이퍼파라미터 (학습 시 이 값들을 바꿔가며 실험)
 # config.py의 get_config() 기본값과 병합됩니다.
+# Base: N=6, dmodel=512, dff=2048, h=8, dk=dv=64, Pdrop=0.1, εls=0.1, 100K steps
 d_model: 512
 n_head: 8
 d_ff: 2048
 layers: 6
+dropout: 0.1      # P_drop
+label_smoothing: 0.1  # ε_ls
+max_steps: 100000 # 100K steps (paper base)
 seed: 42
 
 # 배치: null이면 고정 batch_size(문장 수) 사용, 숫자면 토큰 기준 동적 배치
@@ -12,4 +16,4 @@ seed: 42
 tokens_per_batch_src: null
 tokens_per_batch_tgt: null
 # 고정 배치 사용 시 문장 수 (tokens_per_batch_* 가 null일 때만)
-batch_size: 64
+batch_size: 128

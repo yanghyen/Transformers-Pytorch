@@ -11,6 +11,14 @@ def get_all_sentences(ds, lang):
         yield ds[i]["translation"][lang]
 
 
+def get_all_sentences_joint(ds, src_lang, tgt_lang):
+    """Joint BPE 학습용: 각 샘플의 소스·타깃 문장을 순서대로 yield."""
+    for i in range(len(ds)):
+        pair = ds[i]["translation"]
+        yield pair[src_lang]
+        yield pair[tgt_lang]
+
+
 def get_or_build_tokenizer(config, ds, lang):
     from tokenizers import Tokenizer
     from tokenizers.models import BPE
@@ -32,6 +40,31 @@ def get_or_build_tokenizer(config, ds, lang):
     else:
         tokenizer = Tokenizer.from_file(str(tokenizer_path))
         print(f"  Loaded tokenizer for '{lang}' from {tokenizer_path} (vocab size: {tokenizer.get_vocab_size()})")
+    return tokenizer
+
+
+def get_or_build_joint_tokenizer(config, ds, src_lang, tgt_lang):
+    """소스/타깃 말뭉치를 합쳐 하나의 BPE를 학습·로드. 동일 토크나이저를 src/tgt 둘 다에 사용."""
+    from tokenizers import Tokenizer
+    from tokenizers.models import BPE
+    from tokenizers.trainers import BpeTrainer
+    from tokenizers.pre_tokenizers import Whitespace
+
+    joint_path = Path(config.get("tokenizer_joint_file", "data/tokenizer_joint.json"))
+    if not joint_path.exists():
+        vocab_size = config.get("tokenizer_vocab_size", 37000)
+        special_tokens = ["[UNK]", "[PAD]", "[SOS]", "[EOS]"]
+        print(f"  Training joint BPE tokenizer (vocab_size={vocab_size}, min_frequency=2)...")
+        tokenizer = Tokenizer(BPE(unk_token="[UNK]"))
+        tokenizer.pre_tokenizer = Whitespace()
+        trainer = BpeTrainer(vocab_size=vocab_size, special_tokens=special_tokens, min_frequency=2)
+        tokenizer.train_from_iterator(get_all_sentences_joint(ds, src_lang, tgt_lang), trainer=trainer)
+        joint_path.parent.mkdir(parents=True, exist_ok=True)
+        tokenizer.save(str(joint_path))
+        print(f"  -> Saved to {joint_path} (vocab size: {tokenizer.get_vocab_size()})")
+    else:
+        tokenizer = Tokenizer.from_file(str(joint_path))
+        print(f"  Loaded joint tokenizer from {joint_path} (vocab size: {tokenizer.get_vocab_size()})")
     return tokenizer
 
 
@@ -290,13 +323,16 @@ class BilingualDatasetFromIds(Dataset):
             self._build_length_cache()
 
     def _build_length_cache(self):
+        n = len(self.hf_ds)
+        print(f"  Building length cache for token batching ({n:,} examples, may take a few min)...")
         if "src_len" in self.hf_ds.column_names and "tgt_len" in self.hf_ds.column_names:
             self.lengths = [(r["src_len"], r["tgt_len"]) for r in self.hf_ds]
         else:
             self.lengths = [
                 (len(self.hf_ds[i]["src_ids"]), len(self.hf_ds[i]["tgt_ids"]))
-                for i in range(len(self.hf_ds))
+                for i in range(n)
             ]
+        print(f"  -> Length cache done.")
 
     def __len__(self):
         return len(self.hf_ds)
@@ -397,8 +433,8 @@ def _make_tokenize_map_fn(tokenizer_src, tokenizer_tgt, src_lang, tgt_lang, max_
 def build_tokenized_dataset(config, map_batch_size=2000):
     """
     raw 데이터셋을 한 번 BPE 토큰화해 캐시에 저장하고, 학습 시에는 token id만 로드.
-    반환: (train_ds, val_ds, tokenizer_src, tokenizer_tgt)
-    train_ds, val_ds는 BilingualDatasetFromIds (또는 기존 BilingualDataset 호환 인터페이스).
+    반환: (train_ds, val_ds, test_ds, tokenizer_src, tokenizer_tgt)
+    train_ds, val_ds, test_ds는 BilingualDatasetFromIds (또는 기존 BilingualDataset 호환 인터페이스).
     """
     from datasets import load_dataset
 
@@ -407,6 +443,7 @@ def build_tokenized_dataset(config, map_batch_size=2000):
     cache_path = cache_dir / cache_name
     train_path = cache_path / "train"
     val_path = cache_path / "val"
+    test_path = cache_path / "test"
 
     seq_len = config["seq_len"]
     max_enc = seq_len - 2
@@ -414,33 +451,64 @@ def build_tokenized_dataset(config, map_batch_size=2000):
     src_lang = config["lang_src"]
     tgt_lang = config["lang_tgt"]
 
-    if train_path.exists() and val_path.exists():
+    if train_path.exists() and val_path.exists() and test_path.exists():
         from tokenizers import Tokenizer
         from datasets import load_from_disk
 
-        def _tokenizer_path(lang):
-            p = Path(config["tokenizer_file"].format(lang))
-            if p.exists():
-                return str(p)
-            fallback = Path(f"tokenizer_{lang}.json")
-            if fallback.exists():
-                return str(fallback)
-            raise FileNotFoundError(
-                f"Tokenizer not found: {p} (nor {fallback}). "
-                "Delete cache under data/tokenized/ and re-run to build tokenizers in data/."
-            )
+        use_joint_bpe = config.get("use_joint_bpe", False)
+        if use_joint_bpe:
+            joint_path = Path(config.get("tokenizer_joint_file", "data/tokenizer_joint.json"))
+            if not joint_path.exists():
+                raise FileNotFoundError(
+                    f"Joint tokenizer not found: {joint_path}. "
+                    "Delete cache under data/tokenized/ and re-run to build tokenizers."
+                )
+            print(f"Loading pre-tokenized dataset from {cache_path}")
+            print("  Loading train split from disk (may take 1–5 min for large datasets)...")
+            train_hf = load_from_disk(str(train_path))
+            print(f"  -> Train: {len(train_hf)} examples.")
+            print("  Loading val split...")
+            val_hf = load_from_disk(str(val_path))
+            print(f"  -> Val: {len(val_hf)} examples.")
+            print("  Loading test split...")
+            test_hf = load_from_disk(str(test_path))
+            print(f"  -> Test: {len(test_hf)} examples.")
+            tokenizer_src = Tokenizer.from_file(str(joint_path))
+            tokenizer_tgt = tokenizer_src
+        else:
+            def _tokenizer_path(lang):
+                p = Path(config["tokenizer_file"].format(lang))
+                if p.exists():
+                    return str(p)
+                fallback = Path(f"tokenizer_{lang}.json")
+                if fallback.exists():
+                    return str(fallback)
+                raise FileNotFoundError(
+                    f"Tokenizer not found: {p} (nor {fallback}). "
+                    "Delete cache under data/tokenized/ and re-run to build tokenizers in data/."
+                )
 
-        print(f"Loading pre-tokenized dataset from {cache_path}")
-        train_hf = load_from_disk(str(train_path))
-        val_hf = load_from_disk(str(val_path))
-        tokenizer_src = Tokenizer.from_file(_tokenizer_path(src_lang))
-        tokenizer_tgt = Tokenizer.from_file(_tokenizer_path(tgt_lang))
+            print(f"Loading pre-tokenized dataset from {cache_path}")
+            print("  Loading train split from disk (may take 1–5 min for large datasets)...")
+            train_hf = load_from_disk(str(train_path))
+            print(f"  -> Train: {len(train_hf)} examples.")
+            print("  Loading val split...")
+            val_hf = load_from_disk(str(val_path))
+            print(f"  -> Val: {len(val_hf)} examples.")
+            print("  Loading test split...")
+            test_hf = load_from_disk(str(test_path))
+            print(f"  -> Test: {len(test_hf)} examples.")
+            tokenizer_src = Tokenizer.from_file(_tokenizer_path(src_lang))
+            tokenizer_tgt = Tokenizer.from_file(_tokenizer_path(tgt_lang))
         use_token_batching = config.get("tokens_per_batch_src") is not None
+        print("  Wrapping train/val/test in dataset (train may build length cache)...")
         train_ds = BilingualDatasetFromIds(
             train_hf, tokenizer_src, tokenizer_tgt, seq_len, return_variable_length=use_token_batching
         )
         val_ds = BilingualDatasetFromIds(val_hf, tokenizer_src, tokenizer_tgt, seq_len, return_variable_length=False)
-        return train_ds, val_ds, tokenizer_src, tokenizer_tgt
+        test_ds = BilingualDatasetFromIds(test_hf, tokenizer_src, tokenizer_tgt, seq_len, return_variable_length=False)
+        print("  Dataset ready.")
+        return train_ds, val_ds, test_ds, tokenizer_src, tokenizer_tgt
 
     # [1/3] Raw 다운로드
     print("[1/3] Downloading raw dataset...")
@@ -456,8 +524,12 @@ def build_tokenized_dataset(config, map_batch_size=2000):
 
     # [2/3] BPE 토크나이저 학습 또는 로드
     print("[2/3] Building/loading BPE tokenizers...")
-    tokenizer_src = get_or_build_tokenizer(config, raw, src_lang)
-    tokenizer_tgt = get_or_build_tokenizer(config, raw, tgt_lang)
+    if config.get("use_joint_bpe", False):
+        tokenizer_src = get_or_build_joint_tokenizer(config, raw, src_lang, tgt_lang)
+        tokenizer_tgt = tokenizer_src
+    else:
+        tokenizer_src = get_or_build_tokenizer(config, raw, src_lang)
+        tokenizer_tgt = get_or_build_tokenizer(config, raw, tgt_lang)
 
     # [3/3] dataset.map으로 토큰화
     print(f"[3/3] Tokenizing with dataset.map (batch_size={map_batch_size})...")
@@ -474,27 +546,36 @@ def build_tokenized_dataset(config, map_batch_size=2000):
     n = len(ds_tokenized)
     print(f"  -> Tokenized {n} examples.")
 
-    # Train/Val 분리 및 저장
-    train_size = int(0.9 * n)
-    val_size = n - train_size
+    # Train / Val / Test 분리 및 저장
+    r_train = config.get("dataset_train_ratio", 0.8)
+    r_val = config.get("dataset_val_ratio", 0.1)
+    r_test = config.get("dataset_test_ratio", 0.1)
+    assert abs(r_train + r_val + r_test - 1.0) < 1e-6, "dataset_train/val/test_ratio 합이 1.0이어야 합니다."
+    train_size = int(n * r_train)
+    val_size = int(n * r_val)
+    test_size = n - train_size - val_size
     indices = list(range(n))
     random.seed(config.get("seed", 42))
     random.shuffle(indices)
     train_indices = indices[:train_size]
-    val_indices = indices[train_size:]
+    val_indices = indices[train_size : train_size + val_size]
+    test_indices = indices[train_size + val_size :]
 
     train_hf = ds_tokenized.select(train_indices)
     val_hf = ds_tokenized.select(val_indices)
+    test_hf = ds_tokenized.select(test_indices)
 
     print(f"Saving to disk: {cache_path}")
     cache_path.mkdir(parents=True, exist_ok=True)
     train_hf.save_to_disk(str(train_path))
     val_hf.save_to_disk(str(val_path))
-    print(f"  -> Saved (train={train_size}, val={val_size})")
+    test_hf.save_to_disk(str(test_path))
+    print(f"  -> Saved (train={train_size}, val={val_size}, test={test_size})")
 
     use_token_batching = config.get("tokens_per_batch_src") is not None
     train_ds = BilingualDatasetFromIds(
         train_hf, tokenizer_src, tokenizer_tgt, seq_len, return_variable_length=use_token_batching
     )
     val_ds = BilingualDatasetFromIds(val_hf, tokenizer_src, tokenizer_tgt, seq_len, return_variable_length=False)
-    return train_ds, val_ds, tokenizer_src, tokenizer_tgt
+    test_ds = BilingualDatasetFromIds(test_hf, tokenizer_src, tokenizer_tgt, seq_len, return_variable_length=False)
+    return train_ds, val_ds, test_ds, tokenizer_src, tokenizer_tgt

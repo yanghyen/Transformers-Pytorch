@@ -19,9 +19,9 @@ def get_config(yaml_path=None):
     """기본 설정을 반환합니다. yaml_path가 있으면 해당 YAML과 병합합니다."""
     # "Attention Is All You Need" Table 3 - Base model
     base = {
-        "batch_size": 64,  # used only when tokens_per_batch is None (sentence-based batching) 128도 해보기
-        "tokens_per_batch_src": 25000,   # ~25k source tokens per batch (paper)
-        "tokens_per_batch_tgt": 25000,   # ~25k target tokens per batch (paper); None = use tokens_per_batch_src
+        "batch_size": 128,  # used only when tokens_per_batch is None (sentence-based batching) 128도 해보기
+        "tokens_per_batch_src": 12000,   # ~25k source tokens per batch (paper)
+        "tokens_per_batch_tgt": 12000,   # ~25k target tokens per batch (paper); None = use tokens_per_batch_src
         "num_epochs": 20,
         "lr": 10**-4,
         "seq_len": 100,
@@ -31,6 +31,7 @@ def get_config(yaml_path=None):
         "layers": 6,
         "dropout": 0.1,       # P_drop
         "label_smoothing": 0.1,  # ε_ls
+        "warmup_steps": 4000,    # LR warmup (Attention Is All You Need)
         "max_steps": 100_000,     # 100K steps (paper base)
         "datasource": "wmt/wmt14",  # 이전: opus_books
         "lang_src": "de",
@@ -39,8 +40,13 @@ def get_config(yaml_path=None):
         "model_basename": "tmodel_",
         "preload": "latest",
         "tokenizer_file": "data/tokenizer_{0}.json",
+        "use_joint_bpe": True,  # True: 소스/타깃 공통 BPE 1개, False: 언어별 BPE 2개
+        "tokenizer_joint_file": "data/tokenizer_joint.json",  # use_joint_bpe일 때 사용
         "tokenizer_vocab_size": 37000,  # BPE vocab size (Attention Is All You Need)
         "dataset_cache_dir": "data/tokenized",  # BPE 토큰화 결과 저장; 학습 시 여기서 token id 로드
+        "dataset_train_ratio": 0.8,   # train / val / test 비율 (합 1.0)
+        "dataset_val_ratio": 0.1,
+        "dataset_test_ratio": 0.1,
         "val_metrics_subset_size": 2000,  # 1000스텝마다 검증 메트릭 계산 시 사용할 샘플 수 (None이면 전체)
         "experiment_name": "runs/tmodel",
         "seed": 42,
@@ -52,13 +58,16 @@ def get_config(yaml_path=None):
 
 
 def get_run_id(config):
-    """d_model, n_head, d_ff, layers, seed로 실행 식별자 문자열을 만듭니다."""
+    """d_model, n_head, d_ff, layers, seed로 실행 식별자 문자열을 만듭니다. d_k, d_v가 있으면 포함."""
     d = config.get("d_model", 512)
     h = config.get("n_head", 8)
     f = config.get("d_ff", 2048)
     l = config.get("layers", 6)
     s = config.get("seed", 42)
-    return f"d{d}_h{h}_f{f}_l{l}_s{s}"
+    base = f"d{d}_h{h}_f{f}_l{l}_s{s}"
+    if "d_k" in config and "d_v" in config:
+        return f"d{d}_h{h}_dk{config['d_k']}_dv{config['d_v']}_f{f}_l{l}_s{s}"
+    return base
 
 
 def get_run_dir(config):
@@ -94,11 +103,6 @@ def latest_weights_file_path(config):
 def get_metrics_path(config):
     """runs/run_id/metrics/metrics.csv 경로를 반환합니다."""
     return get_run_dir(config) / "metrics" / "metrics.csv"
-
-
-def get_metrics_10k_path(config):
-    """runs/run_id/metrics/metrics_10k.csv 경로 (10k 스텝마다 전체 val set 메트릭)."""
-    return get_run_dir(config) / "metrics" / "metrics_10k.csv"
 
 
 def get_tensorboard_dir(config):

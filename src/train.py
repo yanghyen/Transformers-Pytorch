@@ -8,7 +8,7 @@ _root = Path(__file__).resolve().parent.parent
 if str(_root) not in sys.path:
     sys.path.insert(0, str(_root))
 
-from config.config import get_config, get_weights_file_path, latest_weights_file_path, get_run_id, ensure_run_dirs, get_tensorboard_dir, get_metrics_path, get_metrics_10k_path, seed_everything
+from config.config import get_config, get_weights_file_path, latest_weights_file_path, get_run_id, ensure_run_dirs, get_tensorboard_dir, get_metrics_path, seed_everything
 from src.model import build_transformer
 from src.dataset.dataset import (
     build_tokenized_dataset,
@@ -179,7 +179,7 @@ def compute_validation_metrics(model, val_dataloader, loss_fn, tokenizer_src, to
     return val_loss, val_ppl, val_acc
 
 def get_ds(config):
-    train_ds, val_ds, tokenizer_src, tokenizer_tgt = build_tokenized_dataset(config)
+    train_ds, val_ds, test_ds, tokenizer_src, tokenizer_tgt = build_tokenized_dataset(config)
 
     if hasattr(train_ds, "hf_ds") and "src_len" in train_ds.hf_ds.column_names:
         max_len_src = max(train_ds.hf_ds["src_len"])
@@ -208,14 +208,16 @@ def get_ds(config):
     else:
         train_dataloader = DataLoader(train_ds, batch_size=config['batch_size'], shuffle=True)
     val_dataloader = DataLoader(val_ds, batch_size=1, shuffle=True)
+    test_dataloader = DataLoader(test_ds, batch_size=1, shuffle=False)
 
-    return train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt
+    return train_dataloader, val_dataloader, test_dataloader, tokenizer_src, tokenizer_tgt
 
 def get_model(config, vocab_src_len, vocab_tgt_len):
     model = build_transformer(
         vocab_src_len, vocab_tgt_len, config["seq_len"], config['seq_len'],
         d_model=config['d_model'], N=config['layers'], h=config['n_head'], d_ff=config['d_ff'],
-        dropout=config['dropout']
+        dropout=config['dropout'],
+        d_k=config.get('d_k'), d_v=config.get('d_v'),
     )
     return model
 
@@ -239,12 +241,12 @@ def train_model(config):
     ensure_run_dirs(config)
     run_id = get_run_id(config)
 
-    train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt = get_ds(config)
+    train_dataloader, val_dataloader, test_dataloader, tokenizer_src, tokenizer_tgt = get_ds(config)
     model = get_model(config, tokenizer_src.get_vocab_size(), tokenizer_tgt.get_vocab_size()).to(device)
     # Tensorboard: runs/run_id/tmodel
     writer = SummaryWriter(str(get_tensorboard_dir(config)))
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=config['lr'], eps=1e-9)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1.0, eps=1e-9)
 
     # If the user specified a model to preload before training, load it
     initial_epoch = 0
@@ -269,22 +271,26 @@ def train_model(config):
     else:
         print('No model to preload, starting from scratch')
 
+    # Paper: lr = d_model^(-0.5) * min(step^(-0.5), step * warmup_steps^(-1.5)); step 1-based
+    warmup_steps = config.get('warmup_steps', 4000)
+    d_model = config['d_model']
+
+    def lr_lambda(step):
+        step_1 = step + 1
+        return (d_model ** -0.5) * min(step_1 ** -0.5, step_1 * (warmup_steps ** -1.5))
+
+    scheduler = LambdaLR(optimizer, lr_lambda, last_epoch=global_step - 1)
+
     pad_id = tokenizer_tgt.token_to_id('[PAD]')
     loss_fn = nn.CrossEntropyLoss(ignore_index=pad_id, label_smoothing=config['label_smoothing']).to(device)
 
     metrics_path = get_metrics_path(config)
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
     metrics_columns = ["step", "d_model", "n_head", "d_ff", "layers", "seed", "train_loss", "train_ppl", "train_acc", "val_loss", "val_ppl", "val_acc", "gpu_time_sec"]
     metrics_file = open(metrics_path, "w", newline="")
     metrics_writer = csv.DictWriter(metrics_file, fieldnames=metrics_columns)
     metrics_writer.writeheader()
     metrics_file.flush()
-
-    metrics_10k_path = get_metrics_10k_path(config)
-    metrics_10k_columns = ["step", "d_model", "n_head", "d_ff", "layers", "seed", "val_loss_full", "val_ppl_full", "val_acc_full", "gpu_time_sec"]
-    metrics_10k_file = open(metrics_10k_path, "w", newline="")
-    metrics_10k_writer = csv.DictWriter(metrics_10k_file, fieldnames=metrics_10k_columns)
-    metrics_10k_writer.writeheader()
-    metrics_10k_file.flush()
 
     start_time = time.perf_counter()
 
@@ -319,11 +325,11 @@ def train_model(config):
                 batch_iterator.set_postfix({"loss": f"{loss.item():6.3f}"})
 
                 gpu_time_sec = time.perf_counter() - start_time
-                if global_step > 0 and global_step % 1000 == 0:
+                if global_step > 0 and global_step % 5000 == 0:
                     val_loss, val_ppl, val_acc = compute_validation_metrics(
                         model, val_dataloader, loss_fn, tokenizer_src, tokenizer_tgt,
                         config['seq_len'], device, pad_id, tokenizer_tgt.get_vocab_size(),
-                        max_samples=config.get("val_metrics_subset_size", 2000),
+                        max_samples=5000,
                     )
                     metrics_writer.writerow({
                         "step": global_step,
@@ -342,29 +348,9 @@ def train_model(config):
                     })
                     metrics_file.flush()
 
-                if global_step > 0 and global_step % 10000 == 0:
-                    val_loss_full, val_ppl_full, val_acc_full = compute_validation_metrics(
-                        model, val_dataloader, loss_fn, tokenizer_src, tokenizer_tgt,
-                        config['seq_len'], device, pad_id, tokenizer_tgt.get_vocab_size(),
-                        max_samples=None,
-                    )
-                    gpu_time_sec_10k = time.perf_counter() - start_time
-                    metrics_10k_writer.writerow({
-                        "step": global_step,
-                        "d_model": config["d_model"],
-                        "n_head": config["n_head"],
-                        "d_ff": config["d_ff"],
-                        "layers": config["layers"],
-                        "seed": config.get("seed", 42),
-                        "val_loss_full": f"{val_loss_full:.6f}",
-                        "val_ppl_full": f"{val_ppl_full:.6f}",
-                        "val_acc_full": f"{val_acc_full:.6f}",
-                        "gpu_time_sec": f"{gpu_time_sec_10k:.2f}",
-                    })
-                    metrics_10k_file.flush()
-
-                # Log the loss
+                # Log the loss and learning rate
                 writer.add_scalar('train loss', loss.item(), global_step)
+                writer.add_scalar('learning_rate', scheduler.get_last_lr()[0], global_step)
                 writer.flush()
 
                 # Backpropagate the loss
@@ -372,6 +358,7 @@ def train_model(config):
 
                 # Update the weights
                 optimizer.step()
+                scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
                 global_step += 1
@@ -404,7 +391,6 @@ def train_model(config):
             }, model_filename)
     finally:
         metrics_file.close()
-        metrics_10k_file.close()
 
 if __name__ == '__main__':
     warnings.filterwarnings("ignore")
